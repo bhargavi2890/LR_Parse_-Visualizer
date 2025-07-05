@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SLR Parser Visualizer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [grammar, setGrammar] = useState('S -> C C\nC -> a C | d');
+      const [inputString, setInputString] = useState('a a d d');
+      const [canonicalOutput, setCanonicalOutput] = useState('');
+      const [tableData, setTableData] = useState([]);
+      const [parseOutput, setParseOutput] = useState('');
+      const [parseTableData, setParseTableData] = useState([]);
+      const [pyodide, setPyodide] = useState(null);
+      const [isLoading, setIsLoading] = useState(false);
+      const [error, setError] = useState(null);
+
+      useEffect(() => {
+        async function loadPyodideAndRun() {
+          setIsLoading(true);
+          try {
+            const pyodideInstance = await loadPyodide();
+            await pyodideInstance.loadPackage("micropip");
+            setPyodide(pyodideInstance);
+            console.log("Pyodide loaded successfully");
+          } catch (error) {
+            console.error("Error loading Pyodide:", error);
+            setError(`Error loading Pyodide: ${error.message}`);
+            setCanonicalOutput(`Error: Failed to load Pyodide`);
+            setTableData([{ State: "I0", error: `Failed to load Pyodide: ${error.message}` }]);
+            setParseOutput(`Error: Failed to load Pyodide`);
+          } finally {
+            setIsLoading(false);
+          }
+        }
+        loadPyodideAndRun();
+      }, []);
+
+      const pythonCode = `import json
+from collections import defaultdict
+
+def slr_parser(grammar, input_string, step):
+    output = []
+    table_data = []
+    parse_steps = []
+    
+    def add_output(text):
+        output.append(text)
+    
+    def add_table_row(state, actions):
+        table_data.append({"State": state, **actions})
+    
+    def add_parse_step(stack, input_buffer, action_goto, parsing_action):
+        parse_steps.append({
+            "stack": stack,
+            "input_buffer": input_buffer,
+            "action_goto": action_goto,
+            "parsing_action": parsing_action
+        })
+    
+    rules = []
+    nonterminals = set()
+    terminals = set()
+    start_symbol = ""
+    augmented_rules = []
+    states = []
+    state_count = 0
+    goto_table = defaultdict(dict)
+    action_table = defaultdict(dict)
+    first_sets = {}
+    follow_sets = {}
+    
+    def parse_grammar():
+        nonlocal rules, nonterminals, terminals, start_symbol
+        lines = grammar.strip().split('\\n')
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                add_output(f"Line {i}: Invalid format! Please use '->' between LHS and RHS")
+                return False, f"Invalid format on line {i}"
+            lhs, rhs = map(str.strip, line.split("->"))
+            if not lhs:
+                add_output(f"Line {i}: Empty LHS not allowed")
+                return False, f"Empty LHS on line {i}"
+            nonterminals.add(lhs)
+            productions = [prod.strip().split() for prod in rhs.split("|")]
+            for prod in productions:
+                if not prod:
+                    add_output(f"Line {i}: Empty production not allowed")
+                    return False, f"Empty production on line {i}"
+                rule = {'lhs': lhs, 'rhs': prod, 'index': len(rules) + 1}
+                rules.append(rule)
+                for symbol in prod:
+                    if symbol not in nonterminals:
+                        terminals.add(symbol)
+        start_symbol = rules[0]['lhs'] if rules else ""
+        if not start_symbol:
+            add_output("No valid rules found")
+            return False, "No valid rules"
+        for rule in rules:
+            for symbol in rule['rhs']:
+                if any(r['lhs'] == symbol for r in rules):
+                    nonterminals.add(symbol)
+                    terminals.discard(symbol)
+        if step == 'canonical':
+            add_output("\\nNon-terminals detected: " + str(sorted(list(nonterminals))))
+            add_output("Terminals detected: " + str(sorted(list(terminals))))
+            add_output(f"Start symbol: {start_symbol}")
+            add_output("\\nGrammar input:")
+            for rule in rules:
+                add_output(f"{rule['lhs']} -> {' '.join(rule['rhs'])} (R{rule['index']})")
+        return True, ""
+
+    def grammar_augmentation():
+        nonlocal augmented_rules, start_symbol
+        augmented_start_symbol = start_symbol + "'"
+        nonterminals.add(augmented_start_symbol)
+        augmented_rules = [{"lhs": augmented_start_symbol, "rhs": [start_symbol], "index": 0}]
+        for rule in rules:
+            augmented_rules.append(rule)
+        if step == 'canonical':
+            add_output("\\nAugmented Grammar:")
+            for i, rule in enumerate(augmented_rules):
+                add_output(f"{i}: {rule['lhs']} -> {' '.join(rule['rhs'])}")
+
+    def compute_first():
+        nonlocal first_sets
+        first_sets = {symbol: set() for symbol in terminals | nonterminals}
+        first_sets['#'] = {'#'}
+        changed = True
+        while changed:
+            changed = False
+            for rule in augmented_rules:
+                lhs = rule['lhs']
+                rhs = rule['rhs']
+                if not rhs:
+                    if '#' not in first_sets[lhs]:
+                        first_sets[lhs].add('#')
+                        changed = True
+                else:
+                    i = 0
+                    while i < len(rhs):
+                        symbol = rhs[i]
+                        if symbol in terminals:
+                            if symbol not in first_sets[lhs]:
+                                first_sets[lhs].add(symbol)
+                                changed = True
+                            break
+                        else:
+                            before = len(first_sets[lhs])
+                            first_sets[lhs].update(first_sets[symbol] - {'#'})
+                            if before != len(first_sets[lhs]):
+                                changed = True
+                            if '#' not in first_sets[symbol]:
+                                break
+                            i += 1
+                    if i == len(rhs) and '#' not in first_sets[lhs]:
+                        first_sets[lhs].add('#')
+                        changed = True
+        if step == 'canonical':
+            add_output("\\nFirst Sets:")
+            for symbol in sorted(first_sets.keys()):
+                add_output(f"FIRST({symbol}) = {sorted(list(first_sets[symbol]))}")
+
+    def compute_follow():
+        nonlocal follow_sets
+        follow_sets = {nt: set() for nt in nonterminals}
+        follow_sets[start_symbol + "'"].add('$')
+        changed = True
+        while changed:
+            changed = False
+            for rule in augmented_rules:
+                lhs = rule['lhs']
+                rhs = rule['rhs']
+                for i in range(len(rhs)):
+                    if rhs[i] in nonterminals:
+                        B = rhs[i]
+                        if i + 1 < len(rhs):
+                            next_symbol = rhs[i + 1]
+                            if next_symbol in terminals:
+                                if next_symbol not in follow_sets[B]:
+                                    follow_sets[B].add(next_symbol)
+                                    changed = True
+                            else:
+                                before = len(follow_sets[B])
+                                follow_sets[B].update(first_sets[next_symbol] - {'#'})
+                                if before != len(follow_sets[B]):
+                                    changed = True
+                        if i + 1 == len(rhs) or (i + 1 < len(rhs) and '#' in first_sets[rhs[i + 1]]):
+                            before = len(follow_sets[B])
+                            follow_sets[B].update(follow_sets[lhs])
+                            if before != len(follow_sets[B]):
+                                changed = True
+        if step == 'canonical':
+            add_output("\\nFollow Sets:")
+            for symbol in sorted(follow_sets.keys()):
+                add_output(f"FOLLOW({symbol}) = {sorted(list(follow_sets[symbol]))}")
+
+    def closure(items):
+        result = set(items)
+        added = True
+        while added:
+            added = False
+            new_items = set()
+            for lhs, rhs, dot in result:
+                if dot < len(rhs):
+                    next_symbol = rhs[dot]
+                    if next_symbol in nonterminals:
+                        for rule in augmented_rules:
+                            if rule['lhs'] == next_symbol:
+                                new_item = (rule['lhs'], tuple(rule['rhs']), 0)
+                                if new_item not in result:
+                                    new_items.add(new_item)
+                                    added = True
+            result.update(new_items)
+        return frozenset(result)
+
+    def goto_state(state, symbol):
+        new_items = set()
+        for lhs, rhs, dot in state:
+            if dot < len(rhs) and rhs[dot] == symbol:
+                new_items.add((lhs, rhs, dot + 1))
+        return closure(new_items) if new_items else None
+
+    def compute_canonical_sets():
+        nonlocal states, state_count
+        state_map = {}
+        initial = closure({(start_symbol + "'", (start_symbol,), 0)})
+        states.append(initial)
+        state_map[initial] = 0
+        state_count = 1
+        if step == 'canonical':
+            add_output("\\nCalculated closure: I0")
+            for lhs, rhs, dot in sorted(initial, key=lambda x: (x[0], x[1], x[2])):
+                add_output(f"{lhs} -> {' '.join(['.' if i == dot else r for i, r in enumerate(rhs)])}")
+        
+        i = 0
+        while i < state_count:
+            state = states[i]
+            symbols = set()
+            for _, rhs, dot in state:
+                if dot < len(rhs):
+                    symbols.add(rhs[dot])
+            for symbol in sorted(symbols):
+                next_state = goto_state(state, symbol)
+                if next_state:
+                    if next_state not in state_map:
+                        state_map[next_state] = state_count
+                        states.append(next_state)
+                        state_count += 1
+                        if step == 'canonical':
+                            add_output(f"\\nCalculated closure: I{state_count-1}")
+                            for lhs, rhs, dot in sorted(next_state, key=lambda x: (x[0], x[1], x[2])):
+                                add_output(f"{lhs} -> {' '.join(['.' if i == dot else r for i, r in enumerate(rhs)])}")
+                    goto_table[i][symbol] = state_map[next_state]
+                    if step == 'canonical':
+                        add_output(f"GOTO ( I{i} , {symbol} ) = I{state_map[next_state]}")
+            i += 1
+        
+        if step == 'canonical':
+            add_output("\\nStates Generated:")
+            for i, state in enumerate(states):
+                add_output(f"\\nState = I{i}")
+                for lhs, rhs, dot in sorted(state, key=lambda x: (x[0], x[1], x[2])):
+                    add_output(f"{lhs} -> {' '.join(['.' if i == dot else r for i, r in enumerate(rhs)])}")
+
+    def create_parse_table():
+        table_data.clear()
+        action_table.clear()
+        
+        all_terminals = sorted(list(terminals)) + ['$']
+        all_nonterminals = sorted(list(nonterminals - {start_symbol + "'"}))
+        
+        header = {"State": "State"}
+        for t in all_terminals:
+            header[t] = t
+        for nt in all_nonterminals:
+            header[nt] = nt
+        add_table_row("State", header)
+        
+        for state_idx in range(state_count):
+            actions = {t: "" for t in all_terminals}
+            gotos = {nt: "" for nt in all_nonterminals}
+            
+            state = states[state_idx]
+            for lhs, rhs, dot in state:
+                if dot < len(rhs):
+                    next_symbol = rhs[dot]
+                    if next_symbol in terminals or next_symbol == '$':
+                        next_state = goto_table[state_idx].get(next_symbol)
+                        if next_state is not None:
+                            if actions[next_symbol] and actions[next_symbol] != f"S{next_state}":
+                                actions[next_symbol] += f"/S{next_state}"
+                            else:
+                                actions[next_symbol] = f"S{next_state}"
+                elif dot == len(rhs):
+                    for rule in augmented_rules:
+                        if rule['lhs'] == lhs and tuple(rule['rhs']) == rhs:
+                            action_num = rule['index']
+                            if action_num > 0:
+                                for t in follow_sets.get(lhs, set()):
+                                    if t in all_terminals:
+                                        action_str = f"R{action_num}"
+                                        if actions[t] and actions[t] != action_str:
+                                            actions[t] += f"/{action_str}"
+                                        else:
+                                            actions[t] = action_str
+                            elif action_num == 0:
+                                actions['$'] = "Accept"
+            
+            for nt in all_nonterminals:
+                if nt in goto_table[state_idx]:
+                    gotos[nt] = str(goto_table[state_idx][nt])
+            
+            state_label = f"I{state_idx}"
+            row = {"State": state_label, **actions, **gotos}
+            add_table_row(state_label, row)
+        
+        if step == 'table':
+            add_output("\\nCreated SLR parsing table")
+
+    def parse_input_string():
+        tokens = input_string.strip().split() + ["$"]
+        stack = [0]
+        pointer = 0
+        steps = []
+        if step == 'parse':
+            add_output("\\nParsing Steps:")
+            add_output("--------------")
+        
+        while True:
+            current_state = stack[-1]
+            current_symbol = tokens[pointer] if pointer < len(tokens) else "$"
+            
+            action = ""
+            for row in table_data[1:]:
+                if row["State"] == f"I{current_state}":
+                    action = row.get(current_symbol, "")
+                    break
+            
+            stack_str = " ".join(str(x) for x in stack)
+            input_str = " ".join(tokens[pointer:])
+            
+            # Determine the parsing action for the table
+            parsing_action = ""
+            if action.startswith("S"):
+                parsing_action = f"Shift to state {action[1:].split(' ')[0]}"
+            elif action.startswith("R"):
+                rule_num = action[1:].split('/')[0]
+                rule = augmented_rules[int(rule_num)]
+                parsing_action = f"Reduce by rule {rule_num}: {rule['lhs']} -> {' '.join(rule['rhs'])}"
+            elif action == "Accept":
+                parsing_action = "Accept - Parsing completed successfully"
+            
+            # Add to both the text output and the table data
+            if step == 'parse':
+                add_output(f"Stack: {stack_str}, Input: {input_str}, Action: {action}")
+                add_parse_step(stack_str, input_str, action, parsing_action)
+            
+            if not action:
+                if step == 'parse':
+                    add_output(f"\\nResult: Input string is REJECTED! (Error at state {current_state}, symbol {current_symbol})")
+                    add_parse_step(stack_str, input_str, "ERROR", f"Error at state {current_state}, symbol {current_symbol}")
+                return steps, False
+            
+            if action.startswith("S"):
+                state_num = int(action.replace("S", ""))
+                stack.extend([current_symbol, state_num])
+                pointer += 1
+            elif action.startswith("R"):
+                rule_num = int(action.replace("R", ""))
+                rule = augmented_rules[rule_num]
+                rhs_len = len(rule['rhs'])
+                if len(stack) < 2 * rhs_len:
+                    if step == 'parse':
+                        add_output(f"\\nResult: Input string is REJECTED! (Stack underflow for rule {rule_num})")
+                        add_parse_step(stack_str, input_str, "ERROR", f"Stack underflow for rule {rule_num}")
+                    return steps, False
+                stack = stack[:-2 * rhs_len]
+                prev_state = stack[-1]
+                lhs = rule['lhs']
+                
+                next_state = ""
+                for row in table_data[1:]:
+                    if row["State"] == f"I{prev_state}":
+                        next_state = row.get(lhs, "")
+                        break
+                
+                if not next_state:
+                    if step == 'parse':
+                        add_output(f"\\nResult: Input string is REJECTED! (Invalid GOTO from state {prev_state} on {lhs})")
+                        add_parse_step(stack_str, input_str, "ERROR", f"Invalid GOTO from state {prev_state} on {lhs}")
+                    return steps, False
+                stack.extend([lhs, int(next_state)])
+            elif action == "Accept":
+                if step == 'parse':
+                    add_output("\\nResult: Input string is ACCEPTED!")
+                    add_parse_step(stack_str, input_str, "ACCEPT", "Input string accepted")
+                return steps, True
+            else:
+                if step == 'parse':
+                    add_output(f"\\nResult: Input string is REJECTED! (Invalid action {action} at state {current_state})")
+                    add_parse_step(stack_str, input_str, "ERROR", f"Invalid action {action} at state {current_state}")
+                return steps, False
+
+    try:
+        success, error = parse_grammar()
+        if not success:
+            return {"error": error, "output": "\\n".join(output), "table_data": table_data, "parse_steps": parse_steps}
+        grammar_augmentation()
+        compute_first()
+        compute_follow()
+        compute_canonical_sets()
+        if step in ['table', 'parse']:
+            create_parse_table()
+        if step == 'parse':
+            steps, accepted = parse_input_string()
+        return {"output": "\\n".join(output), "table_data": table_data, "parse_steps": parse_steps}
+    except Exception as e:
+        add_output(f"Error: {str(e)}")
+        add_table_row("I0", {"error": str(e)})
+        return {"error": str(e), "output": "\\n".join(output), "table_data": table_data, "parse_steps": parse_steps}
+
+def parse_grammar_wrapper(grammar, input_string, step):
+    try:
+        result = slr_parser(grammar, input_string, step)
+        return result
+    except Exception as e:
+        return {"error": str(e), "output": f"Error: {str(e)}", "table_data": [{"State": "I0", "error": str(e)}], "parse_steps": []}
+
+def main(grammar, input_string, step):
+    result = parse_grammar_wrapper(grammar, input_string, step)
+    return json.dumps(result)
+
+def run_main(grammar, input_string, step):
+    return main(grammar, input_string, step)
+`;
+
+      async function runParser(step) {
+        if (!pyodide || isLoading) return;
+        setIsLoading(true);
+        try {
+          const result = await pyodide.runPythonAsync(`
+${pythonCode}
+result = run_main("""${grammar.replace(/"/g, '\\"')}""", "${inputString.replace(/"/g, '\\"')}", "${step}")
+result
+          `);
+          const parsed = JSON.parse(result);
+          if (parsed.error) {
+            if (step === 'canonical') setCanonicalOutput(parsed.output || `Error: ${parsed.error}`);
+            else if (step === 'table') {
+              setTableData(parsed.table_data || [{ State: "I0", error: parsed.error }]);
+              setCanonicalOutput('');
+              setParseOutput('');
+              setParseTableData([]);
+            } else if (step === 'parse') {
+              setParseOutput(parsed.output || `Error: ${parsed.error}`);
+              setParseTableData(parsed.parse_steps || []);
+            }
+            return;
+          }
+          if (step === 'canonical') {
+            setCanonicalOutput(parsed.output);
+            setTableData([]);
+            setParseOutput('');
+            setParseTableData([]);
+          } else if (step === 'table') {
+            setTableData(parsed.table_data || []);
+            setCanonicalOutput('');
+            setParseOutput('');
+            setParseTableData([]);
+          } else if (step === 'parse') {
+            setParseOutput(parsed.output);
+            setParseTableData(parsed.parse_steps || []);
+            setCanonicalOutput('');
+            setTableData([]);
+          }
+        } catch (error) {
+          console.error("RunParser Error:", error);
+          const errorMsg = `Error: ${error.message || 'Unexpected error occurred'}`;
+          setError(errorMsg);
+          if (step === 'canonical') setCanonicalOutput(errorMsg);
+          else if (step === 'table') {
+            setTableData([{ State: "I0", error: errorMsg }]);
+            setCanonicalOutput('');
+            setParseOutput('');
+            setParseTableData([]);
+          } else if (step === 'parse') {
+            setParseOutput(errorMsg);
+            setParseTableData([]);
+          }
+        } finally {
+          setIsLoading(false);
+        }
+      }
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-2xl font-bold mb-4">SLR Parser Visualizer</h1>
+          
+          {isLoading && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+              <div className="bg-white p-4 rounded-lg">
+                <p>Loading Pyodide and running parser...</p>
+              </div>
+            </div>
+          )}
+          
+          {error && <p className="text-red-500 mb-4">{error}</p>}
+          
+          <div className="mb-4">
+            <label className="block mb-2">Grammar (one rule per line, e.g., S {'->'} C C):</label>
+            <textarea
+              className="w-full p-2 border rounded"
+              rows="5"
+              value={grammar}
+              onChange={(e) => setGrammar(e.target.value)}
+              placeholder="e.g., S -> C C\nC -> a C | d"
+            />
+          </div>
+          <div className="mb-4">
+            <label className="block mb-2">Input String:</label>
+            <input
+              className="w-full p-2 border rounded"
+              value={inputString}
+              onChange={(e) => setInputString(e.target.value)}
+              placeholder="e.g., a a d d"
+            />
+          </div>
+
+          <div className="mb-4 space-x-2">
+            <button
+              className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 disabled:bg-blue-300"
+              onClick={() => runParser('canonical')}
+              disabled={isLoading}
+            >
+              Generate Canonical Sets
+            </button>
+            <button
+              className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 disabled:bg-blue-300"
+              onClick={() => runParser('table')}
+              disabled={isLoading}
+            >
+              Build Parsing Table
+            </button>
+            <button
+              className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 disabled:bg-blue-300"
+              onClick={() => runParser('parse')}
+              disabled={isLoading}
+            >
+              Parse String
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <h2 className="text-xl font-semibold mb-2">Canonical Sets</h2>
+              {canonicalOutput && (
+                <pre className="bg-gray-100 p-4 rounded max-h-96 overflow-y-auto whitespace-pre-wrap">
+                  {canonicalOutput}
+                </pre>
+              )}
+            </div>
+            <div>
+              <h2 className="text-xl font-semibold mb-2">Parsing Table</h2>
+              {tableData.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full border-collapse border border-gray-200">
+                    <thead className="bg-gray-100">
+                      <tr>
+                        {Object.keys(tableData[0]).map((key) => (
+                          <th 
+                            key={key} 
+                            className="border border-gray-300 px-4 py-2 text-left"
+                          >
+                            {key}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tableData.slice(1).map((row, i) => (
+                        <tr key={i}>
+                          {Object.entries(row).map(([key, value]) => (
+                            <td 
+                              key={key} 
+                              className={`border border-gray-300 px-4 py-2 ${
+                                typeof value === 'string' && value.startsWith('S') ? 'text-blue-600' : 
+                                typeof value === 'string' && value.startsWith('R') ? 'text-red-600' : 
+                                value === 'Accept' ? 'text-green-600 font-bold' : 
+                                value && value.includes('/') ? 'text-orange-600' : ''
+                              }`}
+                            >
+                              {value || '-'}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {tableData[0]?.error && <p className="text-red-500">{tableData[0].error}</p>}
+              {!tableData.length && <p className="text-gray-500">No table data available.</p>}
+            </div>
+          </div>
+
+          <div className="mt-4">
+            <h2 className="text-xl font-semibold mb-2">Parsing Steps</h2>
+            {parseOutput && (
+              <div>
+                <pre className="bg-gray-100 p-4 rounded max-h-96 overflow-y-auto whitespace-pre-wrap mb-4">
+                  {parseOutput}
+                </pre>
+                
+                {parseTableData.length > 0 && (
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full border-collapse border border-gray-200">
+                      <thead className="bg-gray-100">
+                        <tr>
+                          <th className="border border-gray-300 px-4 py-2 text-left">Stack</th>
+                          <th className="border border-gray-300 px-4 py-2 text-left">Input Buffer</th>
+                          <th className="border border-gray-300 px-4 py-2 text-left">Action/Goto</th>
+                          <th className="border border-gray-300 px-4 py-2 text-left">Parsing Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {parseTableData.map((step, i) => (
+                          <tr key={i}>
+                            <td className="border border-gray-300 px-4 py-2">{step.stack}</td>
+                            <td className="border border-gray-300 px-4 py-2">{step.input_buffer}</td>
+                            <td className={`border border-gray-300 px-4 py-2 ${
+                              step.action_goto.startsWith('S') ? 'text-blue-600' : 
+                              step.action_goto.startsWith('R') ? 'text-red-600' : 
+                              step.action_goto === 'ACCEPT' ? 'text-green-600 font-bold' : 
+                              step.action_goto.includes('ERROR') ? 'text-red-600 font-bold' : ''
+                            }`}>
+                              {step.action_goto}
+                            </td>
+                            <td className="border border-gray-300 px-4 py-2">{step.parsing_action}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
